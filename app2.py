@@ -19,6 +19,7 @@ from mongo_api import router as mongo_router
 
 
 
+
 import json
 import base58
 from pydantic import BaseModel, Field
@@ -37,9 +38,9 @@ from solana.rpc.commitment import Finalized
 from solders.signature import Signature
 from fastapi.middleware.cors import CORSMiddleware
 
-
-
 load_dotenv()
+# Add this line right here:
+SOLANA_CLIENT = Client(os.getenv("SOLANA_RPC_URL", "https://api.devnet.solana.com"))
 
 app = FastAPI(title="Snowflake Events API")
 app.include_router(mongo_router)
@@ -312,110 +313,57 @@ from solders.signature import Signature
 import json
 from fastapi import HTTPException
 
-@app.get("/solana/devnet/memo/{signature}", response_model=dict)
-def get_memo_from_signature(signature: str):
-    """
-    Fetch a devnet transaction by signature and extract Memo text.
-    Works across solana-py/solders versions by trying multiple object paths.
-    """
+@app.get("/solana/devnet/memo/{signature}")
+def get_memo(signature: str):
     try:
-        client = get_solana_client()
+        print(f"DEBUG: Processing signature {signature}")
         sig = Signature.from_string(signature)
-
-        resp = client.get_transaction(
-            sig,
-            encoding="jsonParsed",
-            max_supported_transaction_version=0,
+        
+        # We use jsonParsed to get the logs in a readable format
+        resp = SOLANA_CLIENT.get_transaction(
+            sig, 
+            encoding="jsonParsed", 
+            max_supported_transaction_version=0
         )
-
+        
         if not resp.value:
-            raise HTTPException(status_code=404, detail="Transaction not found (or not available yet).")
+            raise HTTPException(status_code=404, detail="TX not found")
 
-        v = resp.value
+        # CRITICAL: Solders objects can't be indexed like dicts. 
+        # We must navigate the object attributes.
+        meta = resp.value.transaction.meta
+        if not meta:
+            raise HTTPException(status_code=404, detail="Transaction metadata missing")
 
-        # --- Try multiple known shapes to get log messages ---
-        logs = None
-        tried = []
-
-        def try_get_logs(obj, path_name: str):
-            nonlocal logs
-            tried.append(path_name)
-            if obj is None:
-                return
-            # solders uses snake_case: log_messages
-            lm = getattr(obj, "log_messages", None)
-            if isinstance(lm, list):
-                logs = lm
-
-        # Shape A: value.transaction.meta.log_messages
-        tx = getattr(v, "transaction", None)
-        try_get_logs(getattr(tx, "meta", None), "value.transaction.meta.log_messages")
-
-        # Shape B: value.meta.log_messages
-        if logs is None:
-            try_get_logs(getattr(v, "meta", None), "value.meta.log_messages")
-
-        # Shape C: value.transaction_status_meta.log_messages (some wrappers)
-        if logs is None:
-            try_get_logs(getattr(v, "transaction_status_meta", None), "value.transaction_status_meta.log_messages")
-
-        # If still none, use JSON text if available (many solders objects expose to_json())
-        logs_found = 0
+        logs = meta.log_messages
         memos = []
 
-        if logs is None:
-            # Try to_json() on value (best chance to preserve structure)
-            to_json = getattr(v, "to_json", None)
-            if callable(to_json):
-                import json as _json
-                obj = _json.loads(to_json())
-                # common JSON-RPC key
-                logs = (((obj.get("meta") or {}).get("logMessages")) or [])
-                tried.append("value.to_json()->meta.logMessages")
-            else:
-                logs = []
-                tried.append("no logs path matched + no to_json()")
-
-        logs_found = len(logs) if isinstance(logs, list) else 0
-
-        if isinstance(logs, list):
-            for line in logs:
-                marker = "Program log: Memo"
-                if marker in line and "): " in line:
-                    memo_text = line.split("): ", 1)[1].strip()
-
-                    # logs usually wrap memo in quotes
-                    if memo_text.startswith('"') and memo_text.endswith('"'):
-                        memo_text = memo_text[1:-1]
-
-                    # unescape \" etc
+        for line in logs:
+            if "Program log: Memo" in line:
+                # Logs usually look like: Program log: Memo (len 174): "{...}"
+                # We split by the colon and remove the surrounding quotes
+                parts = line.split("): ")
+                if len(parts) > 1:
+                    raw_content = parts[1].strip().strip('"')
+                    # Unescape the string if it contains \"
+                    clean_content = raw_content.replace('\\"', '"')
                     try:
-                        memo_text = memo_text.encode("utf-8").decode("unicode_escape")
-                    except Exception:
-                        pass
-
-                    parsed = None
-                    try:
-                        parsed = json.loads(memo_text)
-                    except Exception:
-                        parsed = None
-
-                    memos.append({"memo": memo_text, "json": parsed})
+                        memos.append(json.loads(clean_content))
+                    except:
+                        memos.append(clean_content)
 
         return {
-            "ok": True,
-            "network": "devnet",
-            "signature": signature,
-            "memos": memos,
-            "log_lines_found": logs_found,
-            "paths_tried": tried,
+            "ok": True, 
+            "signature": signature, 
+            "data": memos[0] if memos else None,
+            "all_memos": memos
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
+        # This will print the error to your TERMINAL window
+        import traceback
+        traceback.print_exc() 
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def get_memo_from_signature(signature: str):
     """
@@ -500,6 +448,309 @@ def get_memo_from_signature(signature: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/solana/devnet/wallet", response_model=dict)
+def devnet_wallet():
+    kp = get_solana_keypair()
+    return {"ok": True, "pubkey": str(kp.pubkey())}
+
+import json
+import traceback
+from fastapi import HTTPException
+
+@app.get("/solana/devnet/balance", response_model=dict)
+def devnet_balance():
+    try:
+        client = get_solana_client()
+        kp = get_solana_keypair()
+
+        resp = client.get_balance(kp.pubkey())
+
+        # ---- Version-proof extraction ----
+        lamports = None
+
+        # Newer solana-py style: resp.value is an int
+        if hasattr(resp, "value"):
+            lamports = resp.value
+
+        # Some wrappers: resp["result"]["value"]
+        if lamports is None:
+            try:
+                obj = json.loads(json.dumps(resp, default=str))
+                lamports = (obj.get("result") or {}).get("value")
+            except Exception:
+                lamports = None
+
+        if lamports is None:
+            raise RuntimeError(f"Could not parse get_balance response: {resp}")
+
+        return {
+            "ok": True,
+            "pubkey": str(kp.pubkey()),
+            "lamports": int(lamports),
+            "sol": float(lamports) / 1_000_000_000,
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=repr(e))
+
+
+# --- SONG METADATA (Snowflake) ------------------------------------------------
+from datetime import datetime
+from typing import Any, Dict, Optional, List
+from pydantic import BaseModel, Field
+
+# If you want to control table via env:
+SONG_METADATA_TABLE = os.getenv("SONG_METADATA_TABLE", "SONG_METADATA")
+
+def _qualified_song_table() -> str:
+    """
+    Uses database/schema from env if present; otherwise assumes your connection already
+    sets them. Fully qualifying prevents 'current database is null' surprises.
+    """
+    db = os.getenv("SNOWFLAKE_DATABASE") or "MY_DB"
+    schema = os.getenv("SNOWFLAKE_SCHEMA") or "PUBLIC"
+    return f'{db}.{schema}.{SONG_METADATA_TABLE}'
+
+
+class SongMetadataRowIn(BaseModel):
+    # Everything optional to avoid errors when fields missing
+    id: Optional[str] = None  # allow client-supplied id; else Snowflake default UUID_STRING()
+    name: Optional[str] = None
+    artist: Optional[str] = None
+    vibe: Optional[str] = None
+
+    bpm: Optional[int] = Field(default=None, ge=0)
+    key: Optional[str] = None
+    mode: Optional[str] = None
+    bars: Optional[int] = Field(default=None, ge=0)
+    energy: Optional[float] = None
+    seed: Optional[int] = None
+
+    audio_url: Optional[str] = None
+    midi_url: Optional[str] = None
+    video_url: Optional[str] = None
+    cover_url: Optional[str] = None
+
+    solana_wallet: Optional[str] = None
+    solana_signature: Optional[str] = None
+
+    audio_sha256: Optional[str] = None
+    ai_prompt: Optional[str] = None
+
+
+class SongMetadataRowOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    artist: Optional[str] = None
+    vibe: Optional[str] = None
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    mode: Optional[str] = None
+    bars: Optional[int] = None
+    energy: Optional[float] = None
+    seed: Optional[int] = None
+    audio_url: Optional[str] = None
+    midi_url: Optional[str] = None
+    video_url: Optional[str] = None
+    cover_url: Optional[str] = None
+    solana_wallet: Optional[str] = None
+    solana_signature: Optional[str] = None
+    audio_sha256: Optional[str] = None
+    ai_prompt: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@app.post("/snowflake/song-metadata", response_model=dict)
+def insert_song_metadata(payload: SongMetadataRowIn):
+    """
+    Insert into SONG_METADATA with all fields optional.
+    If payload.id is None, Snowflake table default (UUID_STRING()) will generate it.
+    Returns inserted id.
+    """
+    table = _qualified_song_table()
+    conn = get_conn()
+
+    try:
+        # Build dynamic insert using only fields that were provided (not None).
+        data = payload.model_dump(exclude_none=True)
+
+        # If client didn't send id, don't include it, so Snowflake default runs.
+        # If client did send id, include it.
+        cols = list(data.keys())
+        vals = [data[c] for c in cols]
+
+        if not cols:
+            # Insert an "empty" row to get defaults (id, created_at)
+            sql = f"INSERT INTO {table} DEFAULT VALUES"
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+
+            # Fetch the last inserted row id (best effort)
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT id FROM {table} ORDER BY created_at DESC LIMIT 1")
+                row = cur.fetchone()
+            return {"ok": True, "id": row[0] if row else None}
+
+        placeholders = ", ".join(["%s"] * len(cols))
+        col_sql = ", ".join(cols)
+
+        sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+        with conn.cursor() as cur:
+            cur.execute(sql, vals)
+        conn.commit()
+
+        # If client supplied id, return it. Otherwise fetch newest row id as best effort.
+        if "id" in data and data["id"]:
+            return {"ok": True, "id": data["id"]}
+
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT id FROM {table} ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+
+        return {"ok": True, "id": row[0] if row else None}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/snowflake/song-metadata", response_model=dict)
+def list_song_metadata(
+    wallet_address: Optional[str] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """
+    List metadata rows. Optionally filter by solana_wallet.
+    """
+    table = _qualified_song_table()
+    conn = get_conn()
+    try:
+        where = ""
+        params: List[Any] = []
+
+        if wallet_address:
+            where = "WHERE solana_wallet = %s"
+            params.append(wallet_address)
+
+        sql = f"""
+            SELECT
+              id, name, artist, vibe, bpm, key, mode, bars, energy, seed,
+              audio_url, midi_url, video_url, cover_url,
+              solana_wallet, solana_signature,
+              audio_sha256, ai_prompt,
+              TO_VARCHAR(created_at)
+            FROM {table}
+            {where}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        params.extend([limit, offset])
+
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "name": r[1],
+                "artist": r[2],
+                "vibe": r[3],
+                "bpm": r[4],
+                "key": r[5],
+                "mode": r[6],
+                "bars": r[7],
+                "energy": r[8],
+                "seed": r[9],
+                "audio_url": r[10],
+                "midi_url": r[11],
+                "video_url": r[12],
+                "cover_url": r[13],
+                "solana_wallet": r[14],
+                "solana_signature": r[15],
+                "audio_sha256": r[16],
+                "ai_prompt": r[17],
+                "created_at": r[18],
+            })
+
+        return {"ok": True, "items": items, "limit": limit, "offset": offset}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/snowflake/song-metadata/{row_id}", response_model=dict)
+def get_song_metadata(row_id: str):
+    """
+    Fetch one row by id.
+    """
+    table = _qualified_song_table()
+    conn = get_conn()
+    try:
+        sql = f"""
+            SELECT
+              id, name, artist, vibe, bpm, key, mode, bars, energy, seed,
+              audio_url, midi_url, video_url, cover_url,
+              solana_wallet, solana_signature,
+              audio_sha256, ai_prompt,
+              TO_VARCHAR(created_at)
+            FROM {table}
+            WHERE id = %s
+            LIMIT 1
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (row_id,))
+            r = cur.fetchone()
+
+        if not r:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        item = {
+            "id": r[0],
+            "name": r[1],
+            "artist": r[2],
+            "vibe": r[3],
+            "bpm": r[4],
+            "key": r[5],
+            "mode": r[6],
+            "bars": r[7],
+            "energy": r[8],
+            "seed": r[9],
+            "audio_url": r[10],
+            "midi_url": r[11],
+            "video_url": r[12],
+            "cover_url": r[13],
+            "solana_wallet": r[14],
+            "solana_signature": r[15],
+            "audio_sha256": r[16],
+            "ai_prompt": r[17],
+            "created_at": r[18],
+        }
+        return {"ok": True, "item": item}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/snowflake/song-metadata/by-wallet/{wallet}", response_model=dict)
+def list_song_metadata_by_wallet(wallet: str, limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    """
+    Convenience: list for a wallet without query params.
+    """
+    return list_song_metadata(wallet_address=wallet, limit=limit, offset=offset)
+
 
 
 if __name__ == "__main__":
