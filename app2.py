@@ -569,6 +569,7 @@ def insert_song_metadata(payload: SongMetadataRowIn):
     If payload.id is None, Snowflake table default (UUID_STRING()) will generate it.
     Returns inserted id.
     """
+    
     table = _qualified_song_table()
     conn = get_conn()
 
@@ -751,6 +752,159 @@ def list_song_metadata_by_wallet(wallet: str, limit: int = Query(50, ge=1, le=50
     """
     return list_song_metadata(wallet_address=wallet, limit=limit, offset=offset)
 
+
+SAVE_PRICE_LAMPORTS = int(float(os.getenv("SAVE_PRICE_SOL", "0.01")) * 1_000_000_000)
+TREASURY = Pubkey.from_string(os.getenv("SOLANA_TREASURY_PUBKEY"))
+
+def verify_payment(signature: str, payer: str):
+    sig = Signature.from_string(signature)
+
+    resp = SOLANA_CLIENT.get_transaction(
+        sig,
+        encoding="jsonParsed",
+        commitment=Finalized,
+        max_supported_transaction_version=0,
+    )
+
+    if not resp.value:
+        raise HTTPException(status_code=400, detail="Transaction not found")
+
+    meta = resp.value.transaction.meta
+    if not meta:
+        raise HTTPException(status_code=400, detail="Missing transaction meta")
+
+    accounts = resp.value.transaction.transaction.message.account_keys
+
+    try:
+        payer_idx = accounts.index(Pubkey.from_string(payer))
+        treasury_idx = accounts.index(TREASURY)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Wallet mismatch")
+
+    received = meta.post_balances[treasury_idx] - meta.pre_balances[treasury_idx]
+
+    if received < SAVE_PRICE_LAMPORTS:
+        raise HTTPException(status_code=402, detail="Insufficient SOL payment")
+
+    return True
+
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
+from fastapi import HTTPException
+from solders.system_program import transfer, TransferParams
+from solana.rpc.commitment import Confirmed
+
+PAYOUT_SOL = float(os.getenv("PAYOUT_SOL", "0.01"))
+
+class PayoutRequest(BaseModel):
+    recipient_wallet: str = Field(..., description="User wallet to receive SOL")
+    amount_sol: float = Field(default=PAYOUT_SOL, ge=0.000001, le=1.0)
+
+@app.post("/solana/devnet/payout", response_model=dict)
+def payout_user(req: PayoutRequest):
+    """
+    Sends SOL from your server wallet (SOLANA_PRIVATE_KEY_BASE58) to the user's wallet.
+    """
+    try:
+        client = get_solana_client()
+        kp = get_solana_keypair()
+        from_pubkey = kp.pubkey()
+
+        to_pubkey = Pubkey.from_string(req.recipient_wallet)
+
+        lamports = int(req.amount_sol * 1_000_000_000)
+        if lamports <= 0:
+            raise HTTPException(status_code=400, detail="amount too small")
+
+        # build transfer instruction
+        ix = transfer(
+            TransferParams(
+                from_pubkey=from_pubkey,
+                to_pubkey=to_pubkey,
+                lamports=lamports,
+            )
+        )
+
+        latest = client.get_latest_blockhash()
+        if not latest.value:
+            raise RuntimeError("Failed to fetch latest blockhash")
+        bh = latest.value.blockhash
+
+        msg = MessageV0.try_compile(
+            payer=from_pubkey,
+            instructions=[ix],
+            address_lookup_table_accounts=[],
+            recent_blockhash=bh,
+        )
+        tx = VersionedTransaction(msg, [kp])
+
+        res = client.send_transaction(tx)
+        if not res.value:
+            raise RuntimeError(f"send_transaction failed: {res}")
+
+        sig_str = str(res.value)
+
+        # optional confirm
+        client.confirm_transaction(Signature.from_string(sig_str), commitment=Confirmed)
+
+        return {
+            "ok": True,
+            "from": str(from_pubkey),
+            "to": str(to_pubkey),
+            "amount_sol": req.amount_sol,
+            "signature": sig_str,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+from pydantic import BaseModel
+from fastapi import HTTPException
+import base64
+
+@app.get("/solana/devnet/latest-blockhash", response_model=dict)
+def latest_blockhash():
+    try:
+        client = get_solana_client()
+        latest = client.get_latest_blockhash()
+        if not latest.value:
+            raise RuntimeError("No latest blockhash")
+        return {"ok": True, "blockhash": str(latest.value.blockhash)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SendRawTxIn(BaseModel):
+    tx_base64: str
+
+
+@app.post("/solana/devnet/send-raw", response_model=dict)
+def send_raw_tx(payload: SendRawTxIn):
+    """
+    Takes a Phantom-signed transaction (base64), broadcasts it, and confirms.
+    """
+    try:
+        client = get_solana_client()
+        raw = base64.b64decode(payload.tx_base64)
+
+        # solana-py supports send_raw_transaction(bytes)
+        res = client.send_raw_transaction(raw)
+        if not res.value:
+            raise RuntimeError(f"send_raw_transaction failed: {res}")
+
+        sig_str = str(res.value)
+
+        # confirm (best-effort)
+        try:
+            sig = Signature.from_string(sig_str)
+            client.confirm_transaction(sig, commitment="confirmed")
+        except Exception:
+            pass
+
+        return {"ok": True, "signature": sig_str}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
