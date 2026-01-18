@@ -7,6 +7,8 @@ python -m uvicorn app:app --reload
 
 backend2 - 8005 port
 
+python app2.py
+
 
 
 backend3 - 8010 port

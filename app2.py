@@ -35,12 +35,22 @@ from solders.hash import Hash
 from solana.rpc.commitment import Finalized
 
 from solders.signature import Signature
+from fastapi.middleware.cors import CORSMiddleware
+
+
 
 load_dotenv()
 
 app = FastAPI(title="Snowflake Events API")
 app.include_router(mongo_router)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_private_key_bytes():
     path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
